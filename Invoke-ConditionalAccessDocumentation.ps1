@@ -27,6 +27,15 @@
 
 #Requires -Module @{ ModuleName = 'Microsoft.Graph.Identity.SignIns'; ModuleVersion = '1.9.2'}, @{ ModuleName = 'Microsoft.Graph.Authentication'; ModuleVersion = '1.9.2'}, @{ ModuleName = 'Microsoft.Graph.Users'; ModuleVersion = '1.9.2'}, @{ ModuleName = 'Microsoft.Graph.Identity.DirectoryManagement'; ModuleVersion = '1.9.2'}, @{ ModuleName = 'Microsoft.Graph.Groups'; ModuleVersion = '1.9.2'}, @{ ModuleName = 'Microsoft.Graph.Applications'; ModuleVersion = '1.9.2'}
 
+
+[CmdletBinding()]
+param (
+    # Sanitize potentially long list of included/excluded directory roles to either "all" or individual roles
+    [Parameter(Mandatory = $false)]
+    [switch]
+    $SanitizeDirectoryRoles
+)
+
 function Test-Guid {
     <#
     .SYNOPSIS
@@ -66,18 +75,23 @@ $servicePrincipals = Get-MgServicePrincipal -All -ErrorAction Stop
 # Init report
 $conditionalAccessDocumentation = [System.Collections.ArrayList]::new()
 
+if ($SanitizeDirectoryRoles.IsPresent) {
+    # Get-MgDirectoryRole only returns enabled admin roles in tenant
+    $assignedAdminRoles = Get-MgDirectoryRole -All  
+}
+
 # Process all Conditional Access Policies
-foreach ($conditionalAccessPolicy in $conditionalAccessPolicies) {
+foreach ($policy in $conditionalAccessPolicies) {
 
     # Display some progress (based on policy count)
-    $currentIndex = $conditionalAccessPolicies.indexOf($conditionalAccessPolicy)
+    $currentIndex = $conditionalAccessPolicies.indexOf($policy)
     Write-Progress -Activity "Generating Conditional Access Documentation..." -PercentComplete (($currentIndex + 1) / $conditionalAccessPolicies.Count * 100) `
-        -CurrentOperation "Processing Policy '$($conditionalAccessPolicy.DisplayName)' ($currentIndex/$($conditionalAccessPolicies.Count))"
+        -CurrentOperation "Processing Policy '$($policy.DisplayName)' ($currentIndex/$($conditionalAccessPolicies.Count))"
 
     try {
         # Resolve object IDs of included users
         $includeUsers = [System.Collections.ArrayList]::new()
-        $conditionalAccessPolicy.Conditions.Users.IncludeUsers | ForEach-Object {
+        $policy.Conditions.Users.IncludeUsers | ForEach-Object {
             if (Test-Guid $PSItem) {
                 $includeUsers.Add( $(Get-MgUser -userId $PSItem | Select-Object -ExpandProperty DisplayName -ErrorAction Stop)) | Out-Null
             }
@@ -87,7 +101,7 @@ foreach ($conditionalAccessPolicy in $conditionalAccessPolicies) {
         }
         # Resolve object IDs of excluded users
         $excludeUsers = [System.Collections.ArrayList]::new()
-        $conditionalAccessPolicy.Conditions.Users.ExcludeUsers | ForEach-Object {
+        $policy.Conditions.Users.ExcludeUsers | ForEach-Object {
             if (Test-Guid $PSItem) {
                 $excludeUsers.Add($(Get-MgUser -userId $PSItem | Select-Object -ExpandProperty DisplayName -ErrorAction Stop)) | Out-Null
             }
@@ -97,30 +111,60 @@ foreach ($conditionalAccessPolicy in $conditionalAccessPolicies) {
         }
         # Resolve object IDs of included groups
         $includeGroups = [System.Collections.ArrayList]::new()
-        $conditionalAccessPolicy.Conditions.Users.IncludeGroups | ForEach-Object {
+        $policy.Conditions.Users.IncludeGroups | ForEach-Object {
             $includeGroups.Add($(Get-MgGroup -GroupId $PSItem | Select-Object -ExpandProperty DisplayName)) | Out-Null
         }
         # Resolve object IDs of excluded groups
         $excludeGroups = [System.Collections.ArrayList]::new()
-        $conditionalAccessPolicy.Conditions.Users.ExcludeGroups | ForEach-Object {
+        $policy.Conditions.Users.ExcludeGroups | ForEach-Object {
             $excludeGroups.Add( $(Get-MgGroup -GroupId $PSItem | Select-Object -ExpandProperty DisplayName)) | Out-Null
         }
         # Resolve object IDs of included roles
         $includeRoles = [System.Collections.ArrayList]::new()
-        $conditionalAccessPolicy.Conditions.Users.IncludeRoles | ForEach-Object {
+        $policy.Conditions.Users.IncludeRoles | ForEach-Object {
             $roleId = $PSItem
             $includeRoles.Add( $($directoryRoleTemplates | Where-Object { $PSItem.Id -eq $roleId } | Select-Object -ExpandProperty DisplayName)) | Out-Null
         }
 
+        if ($policy.Conditions.Users.IncludeRoles.Length -gt 0 -and $SanitizeDirectoryRoles.IsPresent) {
+
+            [array]$missingRoles = @($assignedAdminRoles | Where-Object { $policy.Conditions.Users.IncludeRoles -notcontains $_.RoleTemplateId } | Select-Object -ExpandProperty DisplayName)
+            
+            $includeRoles.Clear() | Out-Null
+
+            if (-not $missingRoles) {
+                $includeRoles.Add("All assigned directory roles covered") | Out-Null
+            }
+            else {
+                $includeRoles.Add("All except: ") | Out-Null
+                $includeRoles.AddRange($missingRoles) | Out-Null
+            }
+        }
+
         # Resolve object IDs of excluded roles
         $excludeRoles = [System.Collections.ArrayList]::new()
-        $conditionalAccessPolicy.Conditions.Users.ExcludeRoles | ForEach-Object {
+        $policy.Conditions.Users.ExcludeRoles | ForEach-Object {
             $roleId = $PSItem
             $excludeRoles.Add( $($directoryRoleTemplates | Where-Object { $PSItem.Id -eq $roleId } | Select-Object -ExpandProperty DisplayName )) | Out-Null
         }
+
+        if ($policy.Conditions.Users.ExcludeRoles.Length -gt 0 -and $SanitizeDirectoryRoles.IsPresent) {
+
+            [array]$missingRoles = @($assignedAdminRoles | Where-Object { $policy.Conditions.Users.ExcludeRoles -notcontains $_.RoleTemplateId } | Select-Object -ExpandProperty DisplayName)
+            
+            $excludeRoles.Clear() | Out-Null
+
+            if (-not $missingRoles) {
+                $excludeRoles.Add("All assigned directory roles covered") | Out-Null
+            }
+            else {
+                $excludeRoles.Add("All except: ") | Out-Null
+                $excludeRoles.AddRange($missingRoles) | Out-Null
+            }
+        }
         # Resolve object IDs of included apps
         $includeApps = [System.Collections.ArrayList]::new()
-        $conditionalAccessPolicy.Conditions.Applications.IncludeApplications | ForEach-Object {
+        $policy.Conditions.Applications.IncludeApplications | ForEach-Object {
             $servicePrincipalId = $PSItem
             if (Test-Guid $PSItem) {
                 $res = $servicePrincipals | Where-Object { $PSItem.AppId -eq $servicePrincipalId } | Select-Object -ExpandProperty DisplayName
@@ -137,7 +181,7 @@ foreach ($conditionalAccessPolicy in $conditionalAccessPolicies) {
         }
         # Resolve object IDs of excluded apps
         $excludeApps = [System.Collections.ArrayList]::new()
-        $conditionalAccessPolicy.Conditions.Applications.ExcludeApplications | ForEach-Object {
+        $policy.Conditions.Applications.ExcludeApplications | ForEach-Object {
             $servicePrincipalId = $PSItem
             if (Test-Guid $PSItem) {
                 $res = $servicePrincipals | Where-Object { $PSItem.AppId -eq $servicePrincipalId } | Select-Object -ExpandProperty DisplayName
@@ -154,7 +198,7 @@ foreach ($conditionalAccessPolicy in $conditionalAccessPolicies) {
         }
         # Resolve object IDs of included locations
         $includeLocations = [System.Collections.ArrayList]::new()
-        $conditionalAccessPolicy.Conditions.Locations.IncludeLocations | ForEach-Object {
+        $policy.Conditions.Locations.IncludeLocations | ForEach-Object {
             $locationId = $PSItem
             if (Test-Guid $PSItem) {
                 $includeLocations.Add( $($namedLocations | Where-Object { $PSItem.Id -eq $locationId } | Select-Object -ExpandProperty DisplayName)) | Out-Null
@@ -165,7 +209,7 @@ foreach ($conditionalAccessPolicy in $conditionalAccessPolicies) {
         }
         # Resolve object IDs of excluded locations
         $excludeLocations = [System.Collections.ArrayList]::new()
-        $conditionalAccessPolicy.Conditions.Locations.ExcludeLocations | ForEach-Object {
+        $policy.Conditions.Locations.ExcludeLocations | ForEach-Object {
             $locationId = $PSItem
             if (Test-Guid $PSItem) {
                 $excludeLocations.Add( $($namedLocations | Where-Object { $PSItem.Id -eq $locationId } | Select-Object -ExpandProperty DisplayName)) | Out-Null
@@ -175,13 +219,15 @@ foreach ($conditionalAccessPolicy in $conditionalAccessPolicies) {
             }
         }
 
+        # Check for TOUs
+        if ($policy.GrantControls.TermsOfUse) { $policy.GrantControls.BuiltInControls += "TermsOfUse" }
+
         # delimiter for arrays in csv report
         $separator = "`r`n"
-        if ($conditionalAccessPolicy.GrantControls.TermsOfUse) { $conditionalAccessPolicy.GrantControls.BuiltInControls += "TermsOfUse" }
         $conditionalAccessDocumentation.Add(
             [PSCustomObject]@{
-                Name                            = $conditionalAccessPolicy.DisplayName
-                State                           = $conditionalAccessPolicy.State
+                Name                            = $policy.DisplayName
+                State                           = $policy.State
 
                 IncludeUsers                    = $includeUsers -join $separator
                 IncludeGroups                   = $includeGroups -join $separator
@@ -194,28 +240,28 @@ foreach ($conditionalAccessPolicy in $conditionalAccessPolicies) {
                 IncludeApps                     = $includeApps -join $separator
                 ExcludeApps                     = $excludeApps -join $separator
 
-                IncludeUserActions              = $conditionalAccessPolicy.Conditions.Applications.IncludeUserActions -join $separator
-                ClientAppTypes                  = $conditionalAccessPolicy.Conditions.ClientAppTypes -join $separator
+                IncludeUserActions              = $policy.Conditions.Applications.IncludeUserActions -join $separator
+                ClientAppTypes                  = $policy.Conditions.ClientAppTypes -join $separator
 
-                IncludePlatforms                = $conditionalAccessPolicy.Conditions.Platforms.IncludePlatforms -join $separator
-                ExcludePlatforms                = $conditionalAccessPolicy.Conditions.Platforms.ExcludePlatforms -join $separator
+                IncludePlatforms                = $policy.Conditions.Platforms.IncludePlatforms -join $separator
+                ExcludePlatforms                = $policy.Conditions.Platforms.ExcludePlatforms -join $separator
 
                 IncludeLocations                = $includeLocations -join $separator
                 ExcludeLocations                = $excludeLocations -join $separator
 
-                IncludeDeviceStates             = $conditionalAccessPolicy.Conditions.Devices.IncludeDeviceStates -join $separator
-                ExcludeDeviceStates             = $conditionalAccessPolicy.Conditions.Devices.ExcludeDeviceStates -join $separator
+                IncludeDeviceStates             = $policy.Conditions.Devices.IncludeDeviceStates -join $separator
+                ExcludeDeviceStates             = $policy.Conditions.Devices.ExcludeDeviceStates -join $separator
 
-                GrantControls                   = $conditionalAccessPolicy.GrantControls.BuiltInControls -join $separator
-                GrantControlsOperator           = $conditionalAccessPolicy.GrantControls.Operator
+                GrantControls                   = $policy.GrantControls.BuiltInControls -join $separator
+                GrantControlsOperator           = $policy.GrantControls.Operator
 
-                SignInRiskLevels                = $conditionalAccessPolicy.Conditions.SignInRiskLevels -join $separator
-                UserRiskLevels                  = $conditionalAccessPolicy.Conditions.UserRiskLevels -join $separator
+                SignInRiskLevels                = $policy.Conditions.SignInRiskLevels -join $separator
+                UserRiskLevels                  = $policy.Conditions.UserRiskLevels -join $separator
 
-                ApplicationEnforcedRestrictions = $conditionalAccessPolicy.SessionControls.ApplicationEnforcedRestrictions.IsEnabled
-                CloudAppSecurity                = $conditionalAccessPolicy.SessionControls.CloudAppSecurity.IsEnabled
-                PersistentBrowser               = $conditionalAccessPolicy.SessionControls.PersistentBrowser.Mode
-                SignInFrequency                 = "$($conditionalAccessPolicy.SessionControls.SignInFrequency.Value) $($conditionalAccessPolicy.SessionControls.SignInFrequency.Type)"
+                ApplicationEnforcedRestrictions = $policy.SessionControls.ApplicationEnforcedRestrictions.IsEnabled
+                CloudAppSecurity                = $policy.SessionControls.CloudAppSecurity.IsEnabled
+                PersistentBrowser               = $policy.SessionControls.PersistentBrowser.Mode
+                SignInFrequency                 = "$($policy.SessionControls.SignInFrequency.Value) $($policy.SessionControls.SignInFrequency.Type)"
             }
         ) | Out-Null
     }
